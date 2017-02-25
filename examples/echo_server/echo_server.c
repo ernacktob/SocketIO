@@ -89,7 +89,11 @@ static void server_error_cb(SocketIOStreamConnection_t conn, void *arg, int err)
 
 	state = (struct connection_state *)arg;
 
-	printf("Got stream connection error: %d (%s).\n", err, strerror(err));
+	if (err == 0)
+		printf("Client disconnected.\n");
+	else
+		printf("Got stream connection error: %d (%s).\n", err, strerror(err));
+
 	free(state);
 }
 

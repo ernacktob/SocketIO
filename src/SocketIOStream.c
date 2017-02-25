@@ -1,9 +1,11 @@
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/errno.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 #include "SocketIOStream.h"
 #include "asyncio.h"
@@ -11,7 +13,13 @@
 #include "safe_malloc.h"
 #include "logging.h"
 
-/* STRUCT DEFINITIONS */
+struct SocketIOStreamClient {
+	SocketIOStreamClient_connect_cb connect_cb;
+	SocketIOStreamClient_connect_error_cb error_cb;
+	void *arg;
+	struct SocketIOStreamConnection *conn;
+};
+
 struct SocketIOStreamServer {
 	int accept_sock;
 	asyncio_handle_t asyncio_handle;
@@ -58,21 +66,43 @@ struct SocketIOStreamConnection {
 	decl_queue(struct StreamBufferSendRequest, sendq);	/* Protected by mtx */
 	decl_queue(struct StreamBufferRecvRequest, recvq);	/* Protected by mtx */
 
+	/* Used for SocketiOStreamClient to indicate connection finished */
+	int finished;						/* Protected by mtx */
+	unsigned int cond_refcount;				/* Protected by mtx */
+	pthread_cond_t cond;					/* Protected by mtx */
+
 	unsigned int refcount;					/* Protexted by mtx */
 	pthread_mutex_t mtx;
 };
 /* END STRUCT DEFINITIONS */
 
 /* PROTOTYPES */
+static int set_nonblocking(int fd);
+
 static struct SocketIOStreamConnection *SocketIOStreamConnection_create(int sockfd);
 static void SocketIOStreamConnection_release(SocketIOStreamConnection_t tconn);
 
 static void handle_stream_recv(int fd, asyncio_fdevent_t revents, void *arg, asyncio_continue_t continued);
 static void handle_stream_send(int fd, asyncio_fdevent_t revents, void *arg, asyncio_continue_t continued);
 static void handle_stream_accept(int fd, asyncio_fdevent_t revents, void *arg, asyncio_continue_t continued);
+static void handle_stream_connect(int fd, asyncio_fdevent_t revents, void *arg, asyncio_continue_t continued);
 
 static int create_accept_sock(const struct sockaddr *addr, socklen_t addrlen, int domain, int protocol, int backlog);
 /* END PROTOTYPES */
+
+static int set_nonblocking(int fd)
+{
+	int oldflags;
+
+	oldflags = fcntl(fd, F_GETFL);
+
+	if (fcntl(fd, F_SETFL, oldflags | O_NONBLOCK) == -1) {
+		SOCKETIO_SYSERROR("fcntl");
+		return -1;
+	}
+
+	return 0;
+}
 
 static struct SocketIOStreamConnection *SocketIOStreamConnection_create(int sockfd)
 {
@@ -89,6 +119,16 @@ static struct SocketIOStreamConnection *SocketIOStreamConnection_create(int sock
 		return NULL;
 	}
 
+	if (pthread_cond_init(&conn->cond, NULL) != 0) {
+		SOCKETIO_SYSERROR("pthread_cond_init");
+
+		if (pthread_mutex_destroy(&conn->mtx) != 0)
+			SOCKETIO_SYSERROR("pthread_mutex_destroy");
+
+		safe_free(conn);
+		return NULL;
+	}
+
 	conn->sockfd = sockfd;
 
 	conn->sendreq = NULL;
@@ -100,6 +140,8 @@ static struct SocketIOStreamConnection *SocketIOStreamConnection_create(int sock
 	queue_init(&conn->sendq);
 	queue_init(&conn->recvq);
 
+	conn->finished = 0;
+	conn->cond_refcount = 0;	/* This only counts the handles held by dispatched threads */
 	conn->refcount = 1;
 
 	return conn;
@@ -116,6 +158,15 @@ static void SocketIOStreamConnection_release(SocketIOStreamConnection_t tconn)
 	if (pthread_mutex_lock(&conn->mtx) != 0) {
 		SOCKETIO_SYSERROR("pthread_mutex_lock");
 		return;
+	}
+
+	if (conn->cond_refcount == 1) {
+		/* We are the last thread that kept connection, so indicate connection is over */
+		--conn->cond_refcount;
+		conn->finished = 1;
+
+		if (pthread_cond_broadcast(&conn->cond) != 0)
+			SOCKETIO_SYSERROR("pthread_cond_broadcast");
 	}
 
 	if (conn->refcount == 0) {
@@ -135,6 +186,9 @@ static void SocketIOStreamConnection_release(SocketIOStreamConnection_t tconn)
 
 		if (pthread_mutex_destroy(&conn->mtx) != 0)
 			SOCKETIO_SYSERROR("pthread_mutex_destroy");
+
+		if (pthread_cond_destroy(&conn->cond) != 0)
+			SOCKETIO_SYSERROR("pthread_cond_destroy");
 
 		queue_foreach(&conn->sendq, sendnode, sendnext) {
 			sendnext = sendnode->next;
@@ -362,6 +416,22 @@ static void handle_stream_accept(int fd, asyncio_fdevent_t revents, void *arg, a
 	asyncio_continue(continued);
 }
 
+static void handle_stream_connect(int fd, asyncio_fdevent_t revents, void *arg, asyncio_continue_t continued)
+{
+	struct SocketIOStreamClient *client;
+	(void)fd;
+	(void)continued;
+
+	client = (struct SocketIOStreamClient *)arg;
+
+	if (revents & ASYNCIO_FDEVENT_ERROR)
+		client->error_cb(client->arg);
+	else
+		client->connect_cb(client->conn, client->arg);
+
+	SocketIOStreamClient_close(client);
+}
+
 static int create_accept_sock(const struct sockaddr *addr, socklen_t addrlen, int domain, int protocol, int backlog)
 {
 	int accept_sock;
@@ -508,6 +578,115 @@ int SocketIOStreamConnection_send(SocketIOStreamConnection_t tconn, const uint8_
 		safe_free(req);
 
 	return rc;
+}
+
+__attribute__((visibility("default")))
+int SocketIOStreamClient_connect(const struct sockaddr *addr, socklen_t addrlen, int domain, int protocol, SocketIOStreamClient_connect_cb connect_cb,
+					SocketIOStreamClient_connect_error_cb error_cb, void *arg, SocketIOStreamClient_t *tclient)
+{
+	struct SocketIOStreamClient *client;
+	struct SocketIOStreamConnection *conn;
+	asyncio_handle_t handle;
+	int sockfd;
+
+	client = safe_malloc(sizeof *client);
+
+	if (client == NULL) {
+		SOCKETIO_ERROR("Failed to malloc client.\n");
+		return -1;
+	}
+
+	sockfd = socket(domain, SOCK_STREAM, protocol);
+
+	if (sockfd == -1) {
+		SOCKETIO_ERROR("Failed to create client sockfd.\n");
+		safe_free(client);
+		return -1;
+	}
+
+	if (set_nonblocking(sockfd) != 0) {
+		SOCKETIO_ERROR("Failed to set sockfd to nonblocking.\n");
+		close(sockfd);
+		safe_free(client);
+		return -1;
+	}
+
+	if (connect(sockfd, addr, addrlen) != 0 && errno != EINPROGRESS) {
+		SOCKETIO_SYSERROR("connect");
+		close(sockfd);
+		safe_free(client);
+		return -1;
+	}
+
+	conn = SocketIOStreamConnection_create(sockfd);
+
+	if (conn == NULL) {
+		SOCKETIO_ERROR("Failed to create SocketIOStreamConnection.\n");
+		close(sockfd);
+		safe_free(client);
+		return -1;
+	}
+
+	/* We're passing it to the handle_stream_connect thread */
+	++(client->conn->refcount);
+	++(client->conn->cond_refcount);
+
+	client->connect_cb = connect_cb;
+	client->error_cb = error_cb;
+	client->arg = arg;
+	client->conn = conn;
+
+	if (asyncio_fdevent(sockfd, ASYNCIO_FDEVENT_WRITE, handle_stream_connect, client, ASYNCIO_FLAG_NONE, &handle) != 0) {
+		SOCKETIO_ERROR("Failed to register fdevent.\n");
+		SocketIOStreamConnection_release(conn);
+		close(sockfd);
+		safe_free(client);
+		return -1;
+	}
+
+	asyncio_release(handle);
+	*tclient = client;
+	return 0;
+}
+
+__attribute__((visibility("default")))
+int SocketIOStreamClient_block(SocketIOStreamClient_t tclient)
+{
+	struct SocketIOStreamClient *client;
+
+	client = (struct SocketIOStreamClient *)tclient;
+
+	if (pthread_mutex_lock(&client->conn->mtx) != 0) {
+		SOCKETIO_SYSERROR("pthread_mutex_lock");
+		return -1;
+	}
+
+	while (!client->conn->finished) {
+		if (pthread_cond_wait(&client->conn->cond, &client->conn->mtx) != 0) {
+			SOCKETIO_SYSERROR("pthread_cond_wait");
+
+			if (pthread_mutex_unlock(&client->conn->mtx) != 0)
+				SOCKETIO_SYSERROR("pthread_mutex_unlock");
+
+			return -1;
+		}
+	}
+
+	if (pthread_mutex_unlock(&client->conn->mtx) != 0)
+		SOCKETIO_SYSERROR("pthread_mutex_unlock");
+
+	return 0;
+}
+
+__attribute__((visibility("default")))
+void SocketIOStreamClient_close(SocketIOStreamClient_t tclient)
+{
+	struct SocketIOStreamClient *client;
+
+	client = (struct SocketIOStreamClient *)tclient;
+
+	SocketIOStreamConnection_release(client->conn);
+	safe_free(client);
 }
 
 __attribute__((visibility("default")))

@@ -1,0 +1,20 @@
+# Ignore all
+*
+
+# Unignore files
+!*.c
+!*.h
+!*.sh
+!*.py
+!.gitignore
+!Makefile
+
+# Unignore all dirs
+!*/
+
+# Ignore lib/asyncio and lib/headers
+lib/asyncio
+lib/headers
+
+# Ignore SocketIOStream.h header copied on top-level directory
+/SocketIOStream.h

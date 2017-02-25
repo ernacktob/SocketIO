@@ -53,4 +53,5 @@ clean:
 	rm -f $(TARGET)
 	rm -f SocketIOStream.h
 	rm -rf obj
+	cd lib && ./cleanup_libs.sh && cd ..
 	$(MAKE) -C examples clean
