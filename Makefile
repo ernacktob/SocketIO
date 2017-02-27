@@ -22,7 +22,7 @@ SRCDIR = src
 LIBDIR = lib
 ODIR = obj
 CC = gcc
-CFLAGS = -Wall -Wextra -Werror -pedantic -fPIC -fvisibility=hidden
+CFLAGS = -Wall -Wextra -Werror -pedantic -fPIC -fvisibility=hidden -DMALLOC_IS_THREAD_SAFE -DFREE_IS_THREAD_SAFE
 LD = ld
 
 .PHONY: default all external_libs objdir public_header examples clean

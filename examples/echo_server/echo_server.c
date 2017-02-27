@@ -13,95 +13,72 @@
 #define TOSTRING(x)	STRINGIFY(x)
 #define STRINGIFY(x)	#x
 
-/* STRUCT DEFINITIONS */
-struct connection_state {
-	char line[MAX_INPUT_LEN + 1];
-	size_t len;
-};
-/* END STRUCT DEFINITIONS */
-
 /* PROTOTYPES */
-static void server_byte_recvd(SocketIOStreamConnection_t conn, void *arg);
+static int server_is_line(const uint8_t *data, size_t len);
+static void server_recvd_line(SocketIOStreamConnection_t conn, void *arg, uint8_t *data, size_t len);
 static void server_response_sent(SocketIOStreamConnection_t conn, void *arg);
-static void server_sniff_cb(SocketIOStreamConnection_t conn, void *arg, const uint8_t *data, size_t len);
+static void server_welcome_sent(SocketIOStreamConnection_t conn, void *arg);
 static void server_error_cb(SocketIOStreamConnection_t conn, void *arg, int err);
 static void server_accept_cb(SocketIOStreamConnection_t conn, const struct sockaddr *addr, socklen_t addrlen);
 /* END PROTOTYPES */
 
-static void server_byte_recvd(SocketIOStreamConnection_t conn, void *arg)
+static int server_is_line(const uint8_t *data, size_t len)
 {
-	struct connection_state *state;
+	if (data[len - 1] == '\n' || len >= MAX_INPUT_LEN)
+		return 1;
 
-	state = (struct connection_state *)arg;
-	++state->len;
+	return 0;
+}
 
-	if (state->line[state->len - 1] == '\n') {
-		if (SocketIOStreamConnection_send(conn, (uint8_t *)state->line, state->len, server_response_sent, server_error_cb, state) != 0) {
+static void server_recvd_line(SocketIOStreamConnection_t conn, void *arg, uint8_t *data, size_t len)
+{
+	const char *errormsg = "ERROR: Line too long.\n";
+	(void)arg;
+
+	if (data[len - 1] != '\n') {
+		if (SocketIOStreamConnection_send(conn, (uint8_t *)errormsg, strlen(errormsg), NULL, server_error_cb, NULL) != 0)
 			printf("Failed to send to SocketIOStreamConnection.\n");
-			free(state);
+
+		free(data);
+	} else {
+		if (SocketIOStreamConnection_send(conn, data, len, server_response_sent, server_error_cb, data) != 0) {
+			printf("Failed to send to SocketIOStreamConnection.\n");
+			free(data);
 		}
-
-		return;
-	}
-
-	if (state->len == MAX_INPUT_LEN + 1) {
-		free(state);
-		return;
-	}
-
-	if (SocketIOStreamConnection_recv(conn, (uint8_t *)state->line + state->len, 1, server_byte_recvd, server_error_cb, server_sniff_cb, state) != 0) {
-		printf("Failed to recv from SocketIOStreamConnection.\n");
-		free(state);
 	}
 }
 
 static void server_response_sent(SocketIOStreamConnection_t conn, void *arg)
 {
-	struct connection_state *state;
+	free(arg);
 
-	state = (struct connection_state *)arg;
-	state->len = 0;
-
-	if (SocketIOStreamConnection_recv(conn, (uint8_t *)state->line, 1, server_byte_recvd, server_error_cb, server_sniff_cb, state) != 0) {
-		printf("Failed to recv from SocketIOStreamConnection.\n");
-		free(state);
-	}
+	if (SocketIOStreamConnection_recvuntil(conn, server_is_line, server_recvd_line, server_error_cb, NULL, NULL) != 0)
+		printf("Failed to recvuntil from SocketIOStreamConnection.\n");
 }
 
-static void server_sniff_cb(SocketIOStreamConnection_t conn, void *arg, const uint8_t *data, size_t len)
+static void server_welcome_sent(SocketIOStreamConnection_t conn, void *arg)
 {
-	size_t i;
-	(void)conn;
 	(void)arg;
 
-	printf("Got %lu bytes of data:\n", len);
-
-	for (i = 0; i < len; i++)
-		printf("%c", data[i]);
-
-	printf("\n");
+	if (SocketIOStreamConnection_recvuntil(conn, server_is_line, server_recvd_line, server_error_cb, NULL, NULL) != 0)
+		printf("Failed to recvuntil from SocketIOStreamConnection.\n");
 }
 
 static void server_error_cb(SocketIOStreamConnection_t conn, void *arg, int err)
 {
-	struct connection_state *state;
 	(void)conn;
-
-	state = (struct connection_state *)arg;
+	(void)arg;
 
 	if (err == 0)
 		printf("Client disconnected.\n");
 	else
 		printf("Got stream connection error: %d (%s).\n", err, strerror(err));
-
-	free(state);
 }
 
 static void server_accept_cb(SocketIOStreamConnection_t conn, const struct sockaddr *addr, socklen_t addrlen)
 {
 	const char *welcome = "Welcome to the echo server.\nType a line of at most "TOSTRING(MAX_INPUT_LEN)" characters, and it will be echoed back.\n\n";
 	struct sockaddr_in *client_addr;
-	struct connection_state *state;
 
 	if (addrlen != sizeof *client_addr) {
 		printf("Wrong size for addrlen!\n");
@@ -111,20 +88,8 @@ static void server_accept_cb(SocketIOStreamConnection_t conn, const struct socka
 	client_addr = (struct sockaddr_in *)addr;
 	printf("Got new connection from %s(%hu).\n", inet_ntoa(client_addr->sin_addr), ntohs(client_addr->sin_port));
 
-	state = malloc(sizeof *state);
-
-	if (state == NULL) {
-		perror("malloc");
-		return;
-	}
-
-	state->line[0] = '\0';
-	state->len = 0;
-
-	if (SocketIOStreamConnection_send(conn, (uint8_t *)welcome, strlen(welcome), server_response_sent, server_error_cb, state) != 0) {
+	if (SocketIOStreamConnection_send(conn, (uint8_t *)welcome, strlen(welcome), server_welcome_sent, server_error_cb, NULL) != 0)
 		printf("Failed to send to SocketIOStreamConnection.\n");
-		free(state);
-	}
 }
 
 int main()

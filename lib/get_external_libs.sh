@@ -14,7 +14,13 @@ then
 	cd $ASYNCIO_SRC
 else
 	cd $ASYNCIO_SRC
-	git pull | grep -q -v 'Already up-to-date.' && changed=1
+	OUTPUT=$(git pull | tee /dev/tty)
+
+	if [[ $OUTPUT == *"Already up-to-date."* ]]; then
+		changed=0
+	else
+		changed=1
+	fi
 fi
 
 make

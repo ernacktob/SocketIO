@@ -1,3 +1,5 @@
+#include <string.h>
+
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
@@ -13,9 +15,11 @@
 #include "safe_malloc.h"
 #include "logging.h"
 
+#define SIZET_MAX	((size_t)(-1))	/* Get rid of compiler warning about C99 long long integer constants */
+
 struct SocketIOStreamClient {
 	SocketIOStreamClient_connect_cb connect_cb;
-	SocketIOStreamClient_connect_error_cb error_cb;
+	SocketIOStreamConnection_error_cb error_cb;
 	void *arg;
 	struct SocketIOStreamConnection *conn;
 };
@@ -41,11 +45,34 @@ struct StreamBufferSendRequest {
 	struct StreamBufferSendRequest *next;
 };
 
+#define DEFAULT_RECV_BUF_SIZE	100
+
 struct StreamBufferRecvRequest {
-	uint8_t *buf;
-	size_t len;
-	size_t pos;
-	SocketIOStreamConnection_done_cb done_cb;
+	int type;
+#define RECV_LENGTH_TYPE	0
+#define RECV_UNTIL_TYPE		1
+
+/* For convenience */
+#define lengthreq		RequestData.LengthRequest
+#define untilreq		RequestData.UntilRequest
+
+	union {
+		struct {
+			uint8_t *buf;
+			size_t len;
+			size_t pos;
+			SocketIOStreamConnection_done_cb done_cb;
+		} LengthRequest;
+
+		struct {
+			uint8_t *buf;
+			size_t mem;
+			size_t pos;
+			SocketIOStreamConnection_until_cb until_cb;
+			SocketIOStreamConnection_until_done_cb until_done_cb;
+		} UntilRequest;
+	} RequestData;
+
 	SocketIOStreamConnection_error_cb error_cb;
 	SocketIOStreamConnection_sniff_cb sniff_cb;
 	void *arg;
@@ -77,6 +104,7 @@ struct SocketIOStreamConnection {
 /* END STRUCT DEFINITIONS */
 
 /* PROTOTYPES */
+static int get_socket_errno(int fd);
 static int set_nonblocking(int fd);
 
 static struct SocketIOStreamConnection *SocketIOStreamConnection_create(int sockfd);
@@ -89,6 +117,21 @@ static void handle_stream_connect(int fd, asyncio_fdevent_t revents, void *arg, 
 
 static int create_accept_sock(const struct sockaddr *addr, socklen_t addrlen, int domain, int protocol, int backlog);
 /* END PROTOTYPES */
+
+static int get_socket_errno(int fd)
+{
+	socklen_t len;
+	int err = 0;
+
+	len = sizeof err;
+
+	if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0) {
+		SOCKETIO_SYSERROR("getsockopt");
+		return 0;
+	}
+
+	return err;
+}
 
 static int set_nonblocking(int fd)
 {
@@ -213,19 +256,37 @@ static void SocketIOStreamConnection_release(SocketIOStreamConnection_t tconn)
 static void handle_stream_recv(int fd, asyncio_fdevent_t revents, void *arg, asyncio_continue_t continued)
 {
 	struct SocketIOStreamConnection *conn;
+	struct StreamBufferRecvRequest *recvreq;
 	ssize_t rb;
+	int done = 0;
+	int err;
 
 	conn = (struct SocketIOStreamConnection *)arg;
+	recvreq = conn->recvreq;
 
 	if (revents & ASYNCIO_FDEVENT_ERROR) {
-		if (conn->recvreq->error_cb)
-			conn->recvreq->error_cb(conn, conn->recvreq->arg, 0);
+		if (recvreq->error_cb) {
+			err = get_socket_errno(fd);
+			recvreq->error_cb(conn, recvreq->arg, err);
+		}
 
 		SocketIOStreamConnection_release(conn);	/* Only release when we don't asyncio_continue */
 		return;
 	}
 
-	rb = recv(fd, conn->recvreq->buf + conn->recvreq->pos, conn->recvreq->len - conn->recvreq->pos, 0);
+	switch (recvreq->type) {
+		case RECV_LENGTH_TYPE:
+			rb = recv(fd, recvreq->lengthreq.buf + recvreq->lengthreq.pos, recvreq->lengthreq.len - recvreq->lengthreq.pos, 0);
+			break;
+
+		case RECV_UNTIL_TYPE:
+			rb = recv(fd, recvreq->untilreq.buf + recvreq->untilreq.pos, 1, 0);
+			break;
+
+		default:
+			SOCKETIO_ERROR("Invalid StreamBufferRecvRequest type.\n");
+			break;
+	}
 
 	if (rb < 0) {
 		if (errno == EINTR || errno == EAGAIN) {
@@ -233,29 +294,93 @@ static void handle_stream_recv(int fd, asyncio_fdevent_t revents, void *arg, asy
 			return;
 		}
 
-		if (conn->recvreq->error_cb)
-			conn->recvreq->error_cb(conn, conn->recvreq->arg, errno);
+		if (recvreq->error_cb)
+			recvreq->error_cb(conn, recvreq->arg, errno);
 
 		SocketIOStreamConnection_release(conn);
 		return;
 	} else if (rb == 0) {
 		/* Connection closed */
-		if (conn->recvreq->error_cb)
-			conn->recvreq->error_cb(conn, conn->recvreq->arg, 0);
+		if (recvreq->error_cb)
+			recvreq->error_cb(conn, recvreq->arg, 0);
 
 		SocketIOStreamConnection_release(conn);
 		return;
 	}
 
-	if (conn->recvreq->sniff_cb)
-		conn->recvreq->sniff_cb(conn, conn->recvreq->arg, conn->recvreq->buf + conn->recvreq->pos, rb);
+	switch (recvreq->type) {
+		case RECV_LENGTH_TYPE:
+			if (recvreq->sniff_cb)
+				recvreq->sniff_cb(conn, recvreq->arg, recvreq->lengthreq.buf + recvreq->lengthreq.pos, rb);
 
-	conn->recvreq->pos += rb;
+			recvreq->lengthreq.pos += rb;
 
-	if (conn->recvreq->pos == conn->recvreq->len) {
-		/* Finished recving all the bytes requested */
-		if (conn->recvreq->done_cb)
-			conn->recvreq->done_cb(conn, conn->recvreq->arg);
+			if (recvreq->lengthreq.pos == recvreq->lengthreq.len)
+				done = 1;
+
+			break;
+
+		case RECV_UNTIL_TYPE:
+			if (recvreq->sniff_cb)
+				recvreq->sniff_cb(conn, recvreq->arg, recvreq->untilreq.buf + recvreq->untilreq.pos, rb);
+
+			recvreq->untilreq.pos += rb;
+
+			if (recvreq->untilreq.until_cb(recvreq->untilreq.buf, recvreq->untilreq.pos)) {
+				done = 1;
+			} else if (recvreq->untilreq.pos >= recvreq->untilreq.mem) {
+				/* Realloc space for buffer */
+				uint8_t *tmp;
+
+				if (recvreq->untilreq.mem >= SIZET_MAX / 2) {
+					if (recvreq->error_cb)
+						recvreq->error_cb(conn, recvreq->arg, ENOMEM);
+
+					SocketIOStreamConnection_release(conn);
+					return;
+				}
+
+				recvreq->untilreq.mem *= 2;
+				tmp = safe_realloc(recvreq->untilreq.buf, recvreq->untilreq.mem);
+
+				if (tmp == NULL) {
+					if (recvreq->error_cb)
+						recvreq->error_cb(conn, recvreq->arg, ENOMEM);
+
+					SocketIOStreamConnection_release(conn);
+					return;
+				}
+
+				recvreq->untilreq.buf = tmp;
+			}
+
+			break;
+
+		default:
+			SOCKETIO_ERROR("Invalid StreamBufferRecvRequest type.\n");
+			break;
+	}
+
+	if (done) {
+		switch (recvreq->type) {
+			case RECV_LENGTH_TYPE:
+				/* Finished recving all the bytes requested */
+				if (recvreq->lengthreq.done_cb)
+					recvreq->lengthreq.done_cb(conn, recvreq->arg);
+
+				break;
+
+			case RECV_UNTIL_TYPE:
+				/* Read until the user is satisfied */
+				if (recvreq->untilreq.until_done_cb)
+					recvreq->untilreq.until_done_cb(conn, recvreq->arg, recvreq->untilreq.buf, recvreq->untilreq.pos);
+
+				break;
+
+			default:
+				SOCKETIO_ERROR("Invalid StreamBufferRecvRequest type.\n");
+				break;
+		}
 
 		/* We don't need lock on mtx up to now, because no other thread
 		 * can be reading or writing the recvreq. The recvreq is only
@@ -298,12 +423,15 @@ static void handle_stream_send(int fd, asyncio_fdevent_t revents, void *arg, asy
 {
 	struct SocketIOStreamConnection *conn;
 	ssize_t sb;
+	int err;
 
 	conn = (struct SocketIOStreamConnection *)arg;
 
 	if (revents & ASYNCIO_FDEVENT_ERROR) {
-		if (conn->sendreq->error_cb)
-			conn->sendreq->error_cb(conn, conn->sendreq->arg, 0);
+		if (conn->sendreq->error_cb) {
+			err = get_socket_errno(fd);
+			conn->sendreq->error_cb(conn, conn->sendreq->arg, err);
+		}
 
 		SocketIOStreamConnection_release(conn);
 		return;
@@ -375,6 +503,7 @@ static void handle_stream_accept(int fd, asyncio_fdevent_t revents, void *arg, a
 	int client_sock;
 	struct sockaddr client_addr;
 	socklen_t client_addrlen;
+	int err;
 
 	server = (struct SocketIOStreamServer *)arg;
 
@@ -386,7 +515,8 @@ static void handle_stream_accept(int fd, asyncio_fdevent_t revents, void *arg, a
 	}
 
 	if (revents & ASYNCIO_FDEVENT_ERROR) {
-		SOCKETIO_ERROR("Error event in accept sock.\n");
+		err = get_socket_errno(fd);
+		SOCKETIO_ERROR("Error event in accept sock: %d (%s)\n", err, strerror(err));
 		SocketIOStreamServer_close(server);
 		return;
 	}
@@ -419,17 +549,20 @@ static void handle_stream_accept(int fd, asyncio_fdevent_t revents, void *arg, a
 static void handle_stream_connect(int fd, asyncio_fdevent_t revents, void *arg, asyncio_continue_t continued)
 {
 	struct SocketIOStreamClient *client;
+	int err;
 	(void)fd;
 	(void)continued;
 
 	client = (struct SocketIOStreamClient *)arg;
 
-	if (revents & ASYNCIO_FDEVENT_ERROR)
-		client->error_cb(client->arg);
-	else
+	if (revents & ASYNCIO_FDEVENT_ERROR) {
+		err = get_socket_errno(fd);
+		client->error_cb(client->conn, client->arg, err);
+	} else {
 		client->connect_cb(client->conn, client->arg);
+	}
 
-	SocketIOStreamClient_close(client);
+	SocketIOStreamConnection_release(client->conn);
 }
 
 static int create_accept_sock(const struct sockaddr *addr, socklen_t addrlen, int domain, int protocol, int backlog)
@@ -482,10 +615,11 @@ int SocketIOStreamConnection_recv(SocketIOStreamConnection_t tconn, uint8_t *dat
 	if (req == NULL)
 		return -1;
 
-	req->buf = data;
-	req->len = len;
-	req->pos = 0;
-	req->done_cb = recv_done_cb;
+	req->type = RECV_LENGTH_TYPE;
+	req->lengthreq.buf = data;
+	req->lengthreq.len = len;
+	req->lengthreq.pos = 0;
+	req->lengthreq.done_cb = recv_done_cb;
 	req->error_cb = error_cb;
 	req->sniff_cb = sniff_cb;
 	req->arg = arg;
@@ -520,6 +654,77 @@ int SocketIOStreamConnection_recv(SocketIOStreamConnection_t tconn, uint8_t *dat
 
 	if (rc != 0)
 		safe_free(req);
+
+	return rc;
+}
+
+__attribute__((visibility("default")))
+int SocketIOStreamConnection_recvuntil(SocketIOStreamConnection_t tconn, SocketIOStreamConnection_until_cb until_cb, SocketIOStreamConnection_until_done_cb until_done_cb,
+					SocketIOStreamConnection_error_cb error_cb, SocketIOStreamConnection_sniff_cb sniff_cb, void *arg)
+{
+	struct SocketIOStreamConnection *conn;
+	struct StreamBufferRecvRequest *req;
+	asyncio_handle_t handle;
+	uint8_t *buf;
+	int rc;
+
+	conn = (struct SocketIOStreamConnection *)tconn;
+
+	req = safe_malloc(sizeof *req);
+
+	if (req == NULL)
+		return -1;
+
+	buf = safe_malloc(DEFAULT_RECV_BUF_SIZE);
+
+	if (buf == NULL) {
+		safe_free(req);
+		return -1;
+	}
+
+	req->type = RECV_UNTIL_TYPE;
+	req->untilreq.buf = buf;
+	req->untilreq.mem = DEFAULT_RECV_BUF_SIZE;
+	req->untilreq.pos = 0;
+	req->untilreq.until_cb = until_cb;
+	req->untilreq.until_done_cb = until_done_cb;
+	req->error_cb = error_cb;
+	req->sniff_cb = sniff_cb;
+	req->arg = arg;
+
+	if (pthread_mutex_lock(&conn->mtx) != 0) {
+		SOCKETIO_SYSERROR("pthread_mutex_lock");
+		safe_free(buf);
+		safe_free(req);
+		return -1;
+	}
+
+	rc = 0;
+
+	if (conn->recving) {
+		queue_push(&conn->recvq, req);
+	} else {
+		conn->recvreq = req;
+		++conn->refcount;
+
+		if (asyncio_fdevent(conn->sockfd, ASYNCIO_FDEVENT_READ | ASYNCIO_FDEVENT_ERROR, handle_stream_recv, conn, ASYNCIO_FLAG_NONE, &handle) == 0) {
+			asyncio_release(handle);
+			conn->recving = 1;
+		} else {
+			SOCKETIO_ERROR("Failed to register fdevent.\n");
+			--conn->refcount; /* Undo refcount increment */
+			conn->recvreq = NULL;
+			rc = -1;
+		}
+	}
+
+	if (pthread_mutex_unlock(&conn->mtx) != 0)
+		SOCKETIO_SYSERROR("pthread_mutex_unlock");
+
+	if (rc != 0) {
+		safe_free(buf);
+		safe_free(req);
+	}
 
 	return rc;
 }
@@ -582,7 +787,7 @@ int SocketIOStreamConnection_send(SocketIOStreamConnection_t tconn, const uint8_
 
 __attribute__((visibility("default")))
 int SocketIOStreamClient_connect(const struct sockaddr *addr, socklen_t addrlen, int domain, int protocol, SocketIOStreamClient_connect_cb connect_cb,
-					SocketIOStreamClient_connect_error_cb error_cb, void *arg, SocketIOStreamClient_t *tclient)
+					SocketIOStreamConnection_error_cb error_cb, void *arg, SocketIOStreamClient_t *tclient)
 {
 	struct SocketIOStreamClient *client;
 	struct SocketIOStreamConnection *conn;
@@ -599,7 +804,7 @@ int SocketIOStreamClient_connect(const struct sockaddr *addr, socklen_t addrlen,
 	sockfd = socket(domain, SOCK_STREAM, protocol);
 
 	if (sockfd == -1) {
-		SOCKETIO_ERROR("Failed to create client sockfd.\n");
+		SOCKETIO_SYSERROR("socket");
 		safe_free(client);
 		return -1;
 	}
@@ -628,8 +833,8 @@ int SocketIOStreamClient_connect(const struct sockaddr *addr, socklen_t addrlen,
 	}
 
 	/* We're passing it to the handle_stream_connect thread */
-	++(client->conn->refcount);
-	++(client->conn->cond_refcount);
+	++(conn->refcount);
+	++(conn->cond_refcount);
 
 	client->connect_cb = connect_cb;
 	client->error_cb = error_cb;
