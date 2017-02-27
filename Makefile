@@ -9,7 +9,7 @@ else
 LIBEXTENSION = so
 LDFLAGS = -shared
 TARGET = libsocketio.so
-EXAMPLES_CFLAGS = -Wl,-rpath=$(shell pwd)	# Tell linker where to look for libasyncio.so when linking examples
+EXAMPLES_CFLAGS = -Wl,-rpath=$(shell pwd) -Wl,-rpath=$(shell pwd)/lib	# Tell linker where to look for libsocketio.so and libasyncio.so when linking examples
 LIBS = -lpthread -lasyncio
 endif
 
