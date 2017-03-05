@@ -525,13 +525,17 @@ static void handle_stream_accept(int fd, asyncio_fdevent_t revents, void *arg, a
 	client_sock = accept(fd, &client_addr, &client_addrlen);
 
 	while (client_sock >= 0) {
-		conn = SocketIOStreamConnection_create(client_sock);
+		if (set_nonblocking(client_sock) == 0) {
+			conn = SocketIOStreamConnection_create(client_sock);
 
-		if (conn == NULL) {
-			SOCKETIO_ERROR("Failed to create SocketIOStreamConnection.\n");
+			if (conn == NULL) {
+				SOCKETIO_ERROR("Failed to create SocketIOStreamConnection.\n");
+			} else {
+				server->accept_cb(conn, &client_addr, client_addrlen);	/* accept_cb better not be blocking */
+				SocketIOStreamConnection_release(conn);
+			}
 		} else {
-			server->accept_cb(conn, &client_addr, client_addrlen);	/* accept_cb bettwr not be blocking */
-			SocketIOStreamConnection_release(conn);
+			SOCKETIO_ERROR("Failed to set client_sock to nonblocking after accept.\n");
 		}
 
 		client_sock = accept(fd, &client_addr, &client_addrlen);
@@ -574,6 +578,12 @@ static int create_accept_sock(const struct sockaddr *addr, socklen_t addrlen, in
 
 	if (accept_sock == -1) {
 		SOCKETIO_SYSERROR("socket");
+		return -1;
+	}
+
+	if (set_nonblocking(accept_sock) != 0) {
+		SOCKETIO_ERROR("Failed to set accept_sock to nonblocking.\n");
+		close(accept_sock);
 		return -1;
 	}
 
@@ -945,7 +955,7 @@ int SocketIOStreamServer_run(SocketIOStreamServer_t tserver, SocketIOStreamServe
 	server->accept_cb = accept_cb;
 	server->accepting = 1;
 
-	if (asyncio_fdevent(server->accept_sock, ASYNCIO_FDEVENT_READ, handle_stream_accept, server, ASYNCIO_FLAG_CANCELLABLE, &asyncio_handle) != 0) {
+	if (asyncio_fdevent(server->accept_sock, ASYNCIO_FDEVENT_READ, handle_stream_accept, server, ASYNCIO_FLAG_NONE, &asyncio_handle) != 0) {
 		SOCKETIO_ERROR("Failed to register fdevent.\n");
 		server->accepting = 0;
 		return -1;
