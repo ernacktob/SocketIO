@@ -883,6 +883,8 @@ int SocketIOStreamClient_connect(SocketIOStreamClient_t tclient, const struct so
 
 	if (asyncio_fdevent(client->sockfd, ASYNCIO_FDEVENT_WRITE, handle_stream_connect, client, ASYNCIO_FLAG_NONE, &handle) != 0) {
 		SOCKETIO_ERROR("Failed to register fdevent.\n");
+		--(conn->refcount);
+		--(conn->cond_refcount);
 		SocketIOStreamConnection_release(conn);
 		close(client->sockfd);
 		safe_free(client);
