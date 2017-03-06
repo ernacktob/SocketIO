@@ -71,6 +71,7 @@ static void datagram_received(SocketIODatagramEndpoint_t endpoint, void *arg, ui
 
 	if (s_addrlen != sizeof *from_addr) {
 		printf("Wrong length for address.\n");
+		free(data);
 		SocketIODatagramEndpoint_continue_listening(continued);
 		return;
 	}
