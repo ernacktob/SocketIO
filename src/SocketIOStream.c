@@ -400,6 +400,7 @@ static void handle_stream_recv(int fd, asyncio_fdevent_t revents, void *arg, asy
 			return;
 		}
 
+		safe_free(conn->recvreq);
 		conn->recving = 0;
 		conn->recvreq = NULL;
 
@@ -477,6 +478,7 @@ static void handle_stream_send(int fd, asyncio_fdevent_t revents, void *arg, asy
 			return;
 		}
 
+		safe_free(conn->sendreq);
 		conn->sending = 0;
 		conn->sendreq = NULL;
 
