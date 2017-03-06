@@ -16,5 +16,7 @@
 lib/asyncio
 lib/headers
 
-# Ignore SocketIOStream.h header copied on top-level directory
+# Ignore headers copied on top-level directory
 /SocketIOStream.h
+/SocketIODatagram.h
+/SocketIO.h

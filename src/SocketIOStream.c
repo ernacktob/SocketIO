@@ -18,10 +18,13 @@
 #define SIZET_MAX	((size_t)(-1))	/* Get rid of compiler warning about C99 long long integer constants */
 
 struct SocketIOStreamClient {
+	int sockfd;
 	SocketIOStreamClient_connect_cb connect_cb;
 	SocketIOStreamConnection_error_cb error_cb;
 	void *arg;
 	struct SocketIOStreamConnection *conn;
+	unsigned int refcount;	/* Protected by mtx */
+	pthread_mutex_t mtx;
 };
 
 struct SocketIOStreamServer {
@@ -538,6 +541,11 @@ static void handle_stream_accept(int fd, asyncio_fdevent_t revents, void *arg, a
 			SOCKETIO_ERROR("Failed to set client_sock to nonblocking after accept.\n");
 		}
 
+		if (!server->accepting) {
+			SocketIOStreamServer_close(server);
+			return;
+		}
+
 		client_sock = accept(fd, &client_addr, &client_addrlen);
 	}
 
@@ -567,6 +575,7 @@ static void handle_stream_connect(int fd, asyncio_fdevent_t revents, void *arg, 
 	}
 
 	SocketIOStreamConnection_release(client->conn);
+	SocketIOStreamClient_close(client); /* Releases our reference to client */
 }
 
 static int create_accept_sock(const struct sockaddr *addr, socklen_t addrlen, int domain, int protocol, int backlog)
@@ -796,12 +805,9 @@ int SocketIOStreamConnection_send(SocketIOStreamConnection_t tconn, const uint8_
 }
 
 __attribute__((visibility("default")))
-int SocketIOStreamClient_connect(const struct sockaddr *addr, socklen_t addrlen, int domain, int protocol, SocketIOStreamClient_connect_cb connect_cb,
-					SocketIOStreamConnection_error_cb error_cb, void *arg, SocketIOStreamClient_t *tclient)
+int SocketIOStreamClient_create(int domain, int protocol, SocketIOStreamClient_t *tclient)
 {
 	struct SocketIOStreamClient *client;
-	struct SocketIOStreamConnection *conn;
-	asyncio_handle_t handle;
 	int sockfd;
 
 	client = safe_malloc(sizeof *client);
@@ -826,19 +832,40 @@ int SocketIOStreamClient_connect(const struct sockaddr *addr, socklen_t addrlen,
 		return -1;
 	}
 
-	if (connect(sockfd, addr, addrlen) != 0 && errno != EINPROGRESS) {
-		SOCKETIO_SYSERROR("connect");
+	if (pthread_mutex_init(&client->mtx, NULL) != 0) {
+		SOCKETIO_SYSERROR("pthread_mutex_init");
 		close(sockfd);
 		safe_free(client);
 		return -1;
 	}
 
-	conn = SocketIOStreamConnection_create(sockfd);
+	client->sockfd = sockfd;
+	client->conn = NULL;
+	client->refcount = 1;
+	*tclient = client;
+
+	return 0;
+}
+
+__attribute__((visibility("default")))
+int SocketIOStreamClient_connect(SocketIOStreamClient_t tclient, const struct sockaddr *addr, socklen_t addrlen,
+		SocketIOStreamClient_connect_cb connect_cb, SocketIOStreamConnection_error_cb error_cb, void *arg)
+{
+	struct SocketIOStreamConnection *conn;
+	struct SocketIOStreamClient *client;
+	asyncio_handle_t handle;
+
+	client = (struct SocketIOStreamClient *)tclient;
+
+	if (connect(client->sockfd, addr, addrlen) != 0 && errno != EINPROGRESS) {
+		SOCKETIO_SYSERROR("connect");
+		return -1;
+	}
+
+	conn = SocketIOStreamConnection_create(client->sockfd);
 
 	if (conn == NULL) {
 		SOCKETIO_ERROR("Failed to create SocketIOStreamConnection.\n");
-		close(sockfd);
-		safe_free(client);
 		return -1;
 	}
 
@@ -850,17 +877,19 @@ int SocketIOStreamClient_connect(const struct sockaddr *addr, socklen_t addrlen,
 	client->error_cb = error_cb;
 	client->arg = arg;
 	client->conn = conn;
+	++(client->refcount);
 
-	if (asyncio_fdevent(sockfd, ASYNCIO_FDEVENT_WRITE, handle_stream_connect, client, ASYNCIO_FLAG_NONE, &handle) != 0) {
+	if (asyncio_fdevent(client->sockfd, ASYNCIO_FDEVENT_WRITE, handle_stream_connect, client, ASYNCIO_FLAG_NONE, &handle) != 0) {
 		SOCKETIO_ERROR("Failed to register fdevent.\n");
 		SocketIOStreamConnection_release(conn);
-		close(sockfd);
+		close(client->sockfd);
 		safe_free(client);
 		return -1;
 	}
 
+	client->sockfd = -1;	/* sockfd stored in the conn from now on... */
 	asyncio_release(handle);
-	*tclient = client;
+
 	return 0;
 }
 
@@ -900,8 +929,40 @@ void SocketIOStreamClient_close(SocketIOStreamClient_t tclient)
 
 	client = (struct SocketIOStreamClient *)tclient;
 
-	SocketIOStreamConnection_release(client->conn);
-	safe_free(client);
+	if (pthread_mutex_lock(&client->mtx) != 0) {
+		SOCKETIO_SYSERROR("pthread_mutex_lock");
+		return;
+	}
+
+	if (client->refcount == 0) {
+		SOCKETIO_ERROR("SocketIOStreamClient refcount is already 0 before close.\n");
+
+		if (pthread_mutex_unlock(&client->mtx) != 0)
+			SOCKETIO_SYSERROR("pthread_mutex_unlock");
+
+		return;
+	}
+
+	--(client->refcount);
+
+	if (client->refcount == 0) {
+		if (pthread_mutex_unlock(&client->mtx) != 0)
+			SOCKETIO_SYSERROR("pthread_mutex_unlock");
+
+		if (pthread_mutex_destroy(&client->mtx) != 0)
+			SOCKETIO_SYSERROR("pthread_mutex_destroy");
+
+		if (client->conn == NULL)
+			close(client->sockfd);
+		else
+			SocketIOStreamConnection_release(client->conn);
+
+		safe_free(client);
+		return;
+	}
+
+	if (pthread_mutex_unlock(&client->mtx) != 0)
+		SOCKETIO_SYSERROR("pthread_mutex_unlock");
 }
 
 __attribute__((visibility("default")))

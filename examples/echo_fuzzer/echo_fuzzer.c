@@ -8,7 +8,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#include "SocketIOStream.h"
+#include "SocketIO.h"
 #include "asyncio.h"
 
 #define NUM_CLIENTS		500
@@ -129,7 +129,12 @@ static void run_client(void *arg, asyncio_continue_t continued)
 	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 	memset(&addr.sin_zero, 0, sizeof addr.sin_zero);
 
-	if (SocketIOStreamClient_connect((struct sockaddr *)&addr, sizeof addr, PF_INET, IPPROTO_TCP, client_connect_cb, client_error_cb, NULL, &client) != 0) {
+	if (SocketIOStreamClient_create(PF_INET, IPPROTO_TCP, &client) != 0) {
+		printf("Failed to create client.\n");
+		return;
+	}
+
+	if (SocketIOStreamClient_connect(client, (struct sockaddr *)&addr, sizeof addr, client_connect_cb, client_error_cb, NULL) != 0) {
 		printf("Failed to connect.\n");
 		return;
 	}

@@ -34,7 +34,7 @@ external_libs:
 objdir:
 	mkdir -p obj
 public_header:
-	cp $(IDIR)/SocketIOStream.h .
+	cp $(IDIR)/SocketIOStream.h $(IDIR)/SocketIODatagram.h $(IDIR)/SocketIO.h .
 
 HEADERS = $(wildcard $(IDIR)/*.h) $(wildcard $(EXTERNAL_IDIR)/*.h)
 SOURCES = $(wildcard $(SRCDIR)/*.c)
@@ -51,7 +51,7 @@ examples: $(TARGET)
 
 clean:
 	rm -f $(TARGET)
-	rm -f SocketIOStream.h
+	rm -f SocketIOStream.h SocketIODatagram.h SocketIO.h
 	rm -rf obj
 	cd lib && ./cleanup_libs.sh && cd ..
 	$(MAKE) -C examples clean

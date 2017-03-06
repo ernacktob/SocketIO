@@ -6,7 +6,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#include "SocketIOStream.h"
+#include "SocketIO.h"
 
 #define MAX_INPUT_LEN	1000
 

@@ -23,8 +23,9 @@ int SocketIOStreamConnection_recvuntil(SocketIOStreamConnection_t conn, SocketIO
 typedef void *SocketIOStreamClient_t;
 typedef void (*SocketIOStreamClient_connect_cb)(SocketIOStreamConnection_t conn, void *arg);
 
-int SocketIOStreamClient_connect(const struct sockaddr *addr, socklen_t addrlen, int domain, int protocol, SocketIOStreamClient_connect_cb connect_cb,
-					SocketIOStreamConnection_error_cb error_cb, void *arg, SocketIOStreamClient_t *client);
+int SocketIOStreamClient_create(int domain, int protocol, SocketIOStreamClient_t *client);
+int SocketIOStreamClient_connect(SocketIOStreamClient_t client, const struct sockaddr *addr, socklen_t addrlen,
+		SocketIOStreamClient_connect_cb connect_cb, SocketIOStreamConnection_error_cb error_cb, void *arg);
 int SocketIOStreamClient_block(SocketIOStreamClient_t client);
 void SocketIOStreamClient_close(SocketIOStreamClient_t client);
 
